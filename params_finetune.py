@@ -1,11 +1,12 @@
+import sys
 import PyPDF2
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import Dataset
-
+import re
 '''
-Extracting tokens from PDF
+Extracting text from PDF
 '''
 def get_text(pdf):
     text = ""
@@ -16,9 +17,50 @@ def get_text(pdf):
 
     return text
 
-pdf = 'dataset/cpsc-handbook-2022.pdf'
-text = get_text(pdf)
+'''
+Spit text into chunks
+'''
+def get_chunks(text, chunk_size=400, overlap=80):
+    chunks = []
+    start = 0
+    i = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start += chunk_size - overlap
 
+    print(f'Length of chunks: {len(chunks)} chunks created')
+    return chunks
+
+def create_answer(chunk):
+    sentences = chunk.split('. ')
+    if len(sentences) >= 3:
+        answer_sentences =[]
+        for s in sentences:
+            if len(s.strip()) < 10:
+                continue
+            if len(' '.join(answer_sentences + [s])) < 350:
+                answer_sentences.append(s)
+            else:
+                break
+
+        answer = '. '.join(answer_sentences)
+        if answer and not answer.endswith('.'):
+            answer += '.'
+    else:
+        answer = chunk[:300]
+        if '.' in answer:
+            answer = answer.rsplit('.', 1)[0] + '.'
+        elif len(answer) > 150:
+            answer = answer[:200] + '...'
+
+    answer = ' '.join(answer.split())
+
+    if answer.count('•') > 3 and 'course' not in answer.lower():
+        return ""
+
+    return answer
 
 '''
 Creating instruction-response pairs manually and automatically
@@ -69,14 +111,30 @@ def manual_IR_pairs():
         {
             "instruction": "Where can I get advising?",
             "input": "",
-            "output": "- CS Department Advising: http://www.fullerton.edu/ecs/cs/resources/advisement.php – Center for Academic Support in ECS (CASECS): http://www.fullerton.edu/ecs/resources/casecs.php – Student Success Center: http://www.fullerton.edu/ecs/resources/StudentSuccessCenter.php – Academic Advisement Center (GE advising): https://www.fullerton.edu/aac/"
+            "output": "You can receive advising in several locations including: - CS Department Advising: http://www.fullerton.edu/ecs/cs/resources/advisement.php – Center for Academic Support in ECS (CASECS): http://www.fullerton.edu/ecs/resources/casecs.php – Student Success Center: http://www.fullerton.edu/ecs/resources/StudentSuccessCenter.php – Academic Advisement Center (GE advising): https://www.fullerton.edu/aac/"
         },
         {
             "instruction": "How many units of Upper Division CS electives are required to complete and what coursees are available?",
             "input": "",
             "output": "At least 12.0 units of Upper Division CS electives are required. You may need to take additional electives if you are short on units due to the Placement Examination, transfer, or other circumstances. The following courses may count as Upper Division CS Electives: - CPSC 301 - Programming Lab Practicum (2 units) - CPSC 349 - Web Front-End Engineering (3 units) - CPSC 375 - Introduction to Data Science and Big Data (3 units) - CPSC 386 - Introduction to Game Design and Production (3 units) - CPSC 411 - Mobile Device Application Programming (3 units) - CPSC 411A - Mobile Device Application Programming for Android (3 units) - CPSC 431 - Database and Applications (3 units) - CPSC 439 - Theory of Computation (3 units) - CPSC 440 - Computer System Architecture (3 units) - CPSC 449 - Web Back-End Engineering (3 units) - CPSC 452 - Cryptography (3 units) - CPSC 454 - Cloud Computing and Security (3 units) - CPSC 455 - Web Security (3 units) - CPSC 456 - Network Security Fundamentals (3 units) - CPSC 458 - Malware Analysis (3 units) - CPSC 459 - Blockchain Technologies (3 units) - CPSC 462 - Software Design (3 units) - CPSC 463 - Software Testing (3 units) - CPSC 464 - Software Architecture (3 units) - CPSC 466 - Software Process (3 units) - CPSC 474 - Parallel and Distributed Computing (3 units) - CPSC 479 - Introduction to High Performance Computing (3 units) - CPSC 483 - Introduction to Machine Learning (3 units) - CPSC 484 - Principles of Computer Graphics (3 units) - CPSC 485 - Computational Bioinformatics (3 units) - CPSC 486 - Game Programming (3 units) - CPSC 489 - Game Development Project (3 units) - CPSC 499 - Independent Study (3 units)"
         },
+         {
+            "instruction": "What happens if a student is placed on academic probation?",
+            "input": "",
+            "output": "Students on probation must meet with an advisor each semester. A registration hold is placed until advisement is completed. Students should discuss strategies to improve grades and address academic challenges."
+        },
+        {
+            "instruction": "Can CS students study abroad?",
+            "input": "",
+            "output": "Yes, CS students can study abroad through the Study Abroad Office. Programs should fit within the study plan. Students should consult with advisors early to ensure courses will transfer appropriately."
+        },
+        {
+            "instruction": "How does independent study (CPSC 499) work?",
+            "input": "",
+            "output": "CPSC 499 allows students to study topics not covered in regular courses under faculty supervision. Applications require faculty advisor and department chair approval. Up to 3 units per semester, maximum 6 units toward the degree."
+        }
     ]
+    return manual_pairs
 
 def auto_IR_pairs(chunks):
     auto_pairs = []
@@ -93,36 +151,64 @@ def auto_IR_pairs(chunks):
         "international": "What resources are available for international students?",
         "study abroad": "Can I study abroad as a CS major?",
         "independent study": "How does independent study (CPSC 499) work?",
-        "waitlist": "How do I petition for a closed class?"
+        "waitlist": "How do I petition for a closed class?",
+        "mathematics": "What mathematics courses are required for CS?",
+        "science": "What science electives are required?",
+        "ge": "What are the GE requirements?",
+        "internship": "Can I get credit for internships?",
+        "cybersecurity": "What is the cybersecurity concentration?",
+        "senior project": "What is the senior capstone project?"
     }
 
-    for i, chunk in enumerate(chunks[20:70]):
+    used_topics = set()
+
+    for i, chunk in enumerate(chunks[50:120]):
+        chunk = ' '.join(chunk.split())
+        if len(chunk) < 200:
+            continue
+        
+        if chunk.count('•') > 5 and 'course' not in chunk.lower():
+            continue
+        if 'Figure' in chunk or 'Table' in chunk: 
+            continue
+
         lowered = chunk.lower()
+
+        matching_topics = []
+
+        for topic, q_template in topic_questions.items():
+            if topic in lowered:
+                matching_topics.append((topic, q_template))    
 
         #find most relevant topic
         question = None
-        for topic, q_template in topic_questions.items():
-            if topic in lowered:
-                if "{}" in q_template:
-                    #get course/program name if possible
-                    lines = chunk.split('\n')
-                    for line in lines:
-                        if "CPSC" in line or "MATH" in line:
-                            question = q_template.format(line.split()[0])
-                            break
-                    if not question:
-                        question = q_template.format("upper-division courses")
-                else:
-                    question = q_template
-                break
-        #defualt question if there is no topic match
-        if not question:
-            question = f'what does the CS handbook say about the topic in section {i+1}?'
+        if matching_topics:
+            for topic, q_template in matching_topics:
+                if topic not in used_topics or list(used_topics).count(topic) < 2:
+                    if "{}" in q_template:
+                        course_match = re.search(r'(CPSC|MATH)\s+\d{3}[A-Z]?', chunk)
+                        if course_match:
+                            question = q_template.format(course_match.group(0))
+                        else:
+                            question = q_template.format("required courses")
+                    else:
+                        question = q_template
 
+                    used_topics.add(topic)
+                    break                    
+
+        if not question:
+            line = chunk.split('.')[0][:100]
+            if len(line) > 30:
+                question = f"what does the CS handbook say about: {line}"
+            else:
+                question = f"what information is in section {i+31} of the CS handbook?"
+        
         #clean and shorten answer
-        answer = chunk[:400].strip()
-        if len(answer) > 400:
-            answer = answer[:397] + ".."
+        answer = create_answer(chunk)
+
+        if len(answer) < 100:
+            continue
 
         auto_pairs.append({
             "instruction": question,
@@ -130,10 +216,45 @@ def auto_IR_pairs(chunks):
             "output": answer
         })
 
+        if len(auto_pairs) >= 50:
+            break
+
     return auto_pairs
 
 
+'''
+Create dataset from PDF text and get instruction response pairs
+'''
+def create_dataset(text):
+    print('calling get_chunks')
+    chunks = get_chunks(text)
 
+    manual_pairs = manual_IR_pairs()
+
+    auto_pairs = auto_IR_pairs(chunks)
+
+    all_pairs = manual_pairs + auto_pairs[:60]
+
+    pairs = []
+    seen = set()
+    for pair in all_pairs:
+        key = pair['instruction'][:50]
+        if key not in seen:
+            pairs.append(pair)
+            seen.add(key)
+
+
+    print(f"created dataset with length of {len(pairs)} total pairs")
+    
+    return pairs
+
+
+pdf = 'dataset/cpsc-handbook-2022.pdf'
+text = get_text(pdf)
+dataset = create_dataset(text)
+
+print(dataset)
+sys.exit(0)
 
 '''
 Loading model and tokenizer
