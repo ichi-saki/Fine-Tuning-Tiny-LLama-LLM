@@ -2,10 +2,13 @@ import sys
 import PyPDF2
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 from datasets import Dataset
 import re
 import json
+
+
+
 '''
 Extracting text from PDF
 '''
@@ -293,24 +296,92 @@ def format(dataset):
 
     return data
 
+'''
 pdf = 'dataset/cpsc-handbook-2022.pdf'
 text = get_text(pdf)
 dataset = create_dataset(text)
 print(f'length of dataset before filtering {len(dataset)}')
 dataset = filter_dataset(dataset)
 print(f'length of dataset after filtering {len(dataset)}')
-
 dataset = format(dataset)
-
 with open('finetune_data.json', 'w') as f:
     json.dump(dataset, f, indent=2)
+'''
 
-sys.exit(0)
+
+'''
+load dataset for training now
+'''
+with open('finefune_data.json', 'r') as f:
+    data = json.load(f)
+
+dataset = Dataset.from_list(data)
+
+train_test_data = dataset.train_test_split(test_size=0.2, seed=42)
+train_data = train_test_data["train"]
+test_data = train_test_data["test"]
+
+print(f'lenght of train {len(train_data)}')
+print(f'length of test {len(test_data)}')
+
+
+'''
+tokenize data
+'''
+def tokenize(examples):
+    tokenized = tokenizer(examples["text"],
+                          truncation=True,
+                          padding="max_length",
+                          max_length=512,
+                          returns_tensors="pt")
+    
+    tokenized["labels"] = tokenized["input_ids"].clone()
+
+    return tokenized
+
+#tokenize data
+tokenized_train = train_data.map(tokenize, batched=True)
+tokenized_test = test_data.map(tokenize, batched=True)
+
+#format for pytorch
+tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+
+'''
+Implement fine tuning methods
+'''
+
+### LoRA fine tuning
+def lora_finetuning(model):
+    model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.1,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    model.print_trainable_parameters()
+
+    return model
+
+### Adapter Fine-tuning
+def adapter_finetuning(model):
+    for param in model.parameters():
+        param.require_grad = False
 
 '''
 Loading model and tokenizer
 '''
-TinyLlama = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-tokenizer = AutoTokenizer.from_pretrained(TinyLlama)
-model = AutoModelForCausalLM.from_pretrained(TinyLlama, load_in_4bit=True, torch_dtype=torch.float16)
+def main():
+    TinyLlama = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    tokenizer = AutoTokenizer.from_pretrained(TinyLlama)
+    model = AutoModelForCausalLM.from_pretrained(TinyLlama, load_in_4bit=True, torch_dtype=torch.float16)
 
