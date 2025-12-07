@@ -5,6 +5,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import Dataset
 import re
+import json
 '''
 Extracting text from PDF
 '''
@@ -40,7 +41,7 @@ def create_answer(chunk):
         for s in sentences:
             if len(s.strip()) < 10:
                 continue
-            if len(' '.join(answer_sentences + [s])) < 350:
+            if len(' '.join(answer_sentences + [s])) < 400:
                 answer_sentences.append(s)
             else:
                 break
@@ -49,11 +50,11 @@ def create_answer(chunk):
         if answer and not answer.endswith('.'):
             answer += '.'
     else:
-        answer = chunk[:300]
+        answer = chunk[:400]
         if '.' in answer:
             answer = answer.rsplit('.', 1)[0] + '.'
         elif len(answer) > 150:
-            answer = answer[:200] + '...'
+            answer = answer[:350] + '...'
 
     answer = ' '.join(answer.split())
 
@@ -248,12 +249,62 @@ def create_dataset(text):
     
     return pairs
 
+def filter_dataset(dataset):
+    indicies = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 21]
+
+    pairs = []
+    for i in indicies:
+        pair = dataset[i]
+
+        answer = pair['output']
+        # Fix for pair 14  
+        if i == 14 and "- Senior Capstone Project" in answer:
+            answer = "CPSC 120 has no prerequisites. It's the first course in the CS sequence. Complete CPSC 120 before CPSC 121, then CPSC 131."
+        
+        # FIX FOR PAIR 15 
+        if i == 15 and "vision CS Electives" in answer:
+            answer = "Use ASSIST.org to check course equivalencies. Transfer courses appear in Titan Degree Audit after evaluation. Some courses may need department approval."
+        
+        # FIX FOR PAIR 
+        if i == 21 and "marked with an asterisk" in answer:
+            answer = "Minimum C grade in CPSC 490 and 491. Minimum C- in GE courses including MATH courses. Minimum D- in other major courses. Overall GPA must be 2.0+."
+        
+        pairs.append({
+            "instruction": pair['instruction'],
+            "input": pair['input'],
+            "output": answer
+        })
+
+    return pairs
+
+
+'''
+Format dataset for TinyLlama chat
+'''
+def format(dataset):
+    data = []
+
+    for item in dataset:
+        text = f"<|system|>\nYou are a helpful assistant knowledgeable about the CSU Fullerton Computer Science undergraduate program. Answer questions based on the 2022-2023 Computer Science Handbook.</s>\n"
+        text += f"<|user|>\n{item['instruction']}</s>\n"
+        text += f"<|assistant|>\n{item['output']}</s>"
+
+        data.append({"text": text})
+
+    return data
 
 pdf = 'dataset/cpsc-handbook-2022.pdf'
 text = get_text(pdf)
 dataset = create_dataset(text)
+print(f'length of dataset before filtering {len(dataset)}')
+dataset = filter_dataset(dataset)
+print(f'length of dataset after filtering {len(dataset)}')
 
-print(dataset)
+dataset = format(dataset)
+
+with open('finetune_data.json', 'w') as f:
+    json.dump(dataset, f, indent=2)
+
 sys.exit(0)
 
 '''
