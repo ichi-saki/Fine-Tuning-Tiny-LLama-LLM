@@ -78,6 +78,61 @@ def manual_IR_pairs():
         },
     ]
 
+def auto_IR_pairs(chunks):
+    auto_pairs = []
+    topic_questions = {
+        "tuffix": "What is Tuffix and how do I install it?",
+        "transfer": "How do transfer credits work for computer science?",
+        "probation": "What happens if I'm placed on academic probation?",
+        "advising": "How do I get academic advising in the CS department?",
+        "elective": "What computer science electives are available?",
+        "minor": "What are the requirements for a CS minor?",
+        "grade": "What are the grade requirements for CS courses?",
+        "prerequisite": "What are the prerequisites for {}?",
+        "accreditation": "Is the CS program accredited?",
+        "international": "What resources are available for international students?",
+        "study abroad": "Can I study abroad as a CS major?",
+        "independent study": "How does independent study (CPSC 499) work?",
+        "waitlist": "How do I petition for a closed class?"
+    }
+
+    for i, chunk in enumerate(chunks[20:70]):
+        lowered = chunk.lower()
+
+        #find most relevant topic
+        question = None
+        for topic, q_template in topic_questions.items():
+            if topic in lowered:
+                if "{}" in q_template:
+                    #get course/program name if possible
+                    lines = chunk.split('\n')
+                    for line in lines:
+                        if "CPSC" in line or "MATH" in line:
+                            question = q_template.format(line.split()[0])
+                            break
+                    if not question:
+                        question = q_template.format("upper-division courses")
+                else:
+                    question = q_template
+                break
+        #defualt question if there is no topic match
+        if not question:
+            question = f'what does the CS handbook say about the topic in section {i+1}?'
+
+        #clean and shorten answer
+        answer = chunk[:400].strip()
+        if len(answer) > 400:
+            answer = answer[:397] + ".."
+
+        auto_pairs.append({
+            "instruction": question,
+            "input": "",
+            "output": answer
+        })
+
+    return auto_pairs
+
+
 
 
 '''
