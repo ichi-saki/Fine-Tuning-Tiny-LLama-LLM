@@ -394,8 +394,17 @@ def adapter_finetuning(model):
     return model
 
 ### Prefix tuning
-#def prefix_finetuning(model):
+def prefix_finetuning(model):
+    config = PrefixTuningConfig(task_type=TaskType.CAUSAL_LM,
+                                num_virtual_tokens=20,
+                                encoder_hidden_size=512,
+                                prefix_projection=True)
     
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()
+
+    return model
+
 
 
 '''
