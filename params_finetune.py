@@ -405,6 +405,14 @@ def prefix_finetuning(model):
 
     return model
 
+def full_finetuning(model):
+    for param in model.parameters():
+        param.requires_gram = True
+    
+    print(f'Trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+
+    return model
+
 
 
 '''
