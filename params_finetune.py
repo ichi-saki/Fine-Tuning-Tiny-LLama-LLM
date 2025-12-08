@@ -2,7 +2,7 @@ import sys
 import PyPDF2
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from peft import LoraConfig, AdapterConfig, PrefixTuningConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 from datasets import Dataset
 import re
 import json
@@ -376,6 +376,27 @@ def lora_finetuning(model):
 def adapter_finetuning(model):
     for param in model.parameters():
         param.require_grad = False
+
+    adapter_config = AdapterConfig(
+        md_adapter=True,
+        output_adapter=True,
+        reduction_factor=16,
+        non_linearity="relu"
+    )
+
+    for name, module in model.named_modules():
+        if "attention" in name or "mlp" in name:
+            module.add_adapter("handcook_adapter", config=adapter_config)
+
+    model.train_adapter("handcook_adapter")
+    print(f'Trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+
+    return model
+
+### Prefix tuning
+#def prefix_finetuning(model):
+    
+
 
 '''
 Loading model and tokenizer
