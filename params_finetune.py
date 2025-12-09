@@ -1,7 +1,7 @@
 import sys
 import PyPDF2
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from peft import LoraConfig, AdapterConfig, PrefixTuningConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 from datasets import Dataset
 import re
@@ -412,6 +412,78 @@ def full_finetuning(model):
     print(f'Trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     return model
+
+'''
+config trainings
+'''
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer), mlm=False
+
+def train_model(model, method, output_dir):
+    training_args = TrainingArguments(
+        output_dir=f'./results/{method}',
+        num_train_epochs=3,
+        per_device_train_batch_size=2,  #need to increa
+        per_device_eval_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=100,
+        logging_steps=10,
+        save_steps=10,
+        eval_steps=50,
+        save_strategy="steps",
+        evaluation_strategy="steps",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        learning_rate=2e-4,
+        fp16=True,
+        push_to_hub=False,
+        report_to="none",
+        ddp_find_unused_parameters=False,
+        remove_unused_columns=False,
+        gradient_checkpointing=True
+    )
+
+    trainer = Trainer(model=model,
+                    args=training_args,
+                    train_dataset=tokenized_train,
+                    eval_dataset=tokenized_test,
+                    data_collator=data_collator,
+                    tokenizer=tokenizer,)
+
+    print(f"\nTraining {method}")
+    trainer.train()
+
+    model.save_pretrained(f'/models/{method}')
+    tokenizer.save_pretrained(f'/models/{method}')
+
+    return trainer
+
+
+def generate_answer(model, tokenizer, question):
+    prompt = f"<|system|>\nYou are a helpful assistant knowledgeable about the CSU Fullerton Computer Science undergraduate program. Answer questions based on the 2022-2023 Computer Science Handbook.</s>\n<|user|>\n{question}</s>\n<|assistant|>\n"
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    #balanced generation
+    generation_config = {
+        "max_new_tokens": 300,
+        "temperature": 0.5,
+        "top_k": 80,
+        "top_p": 0.92,
+        "repetition_penalty": 1.15,
+        "do_sample": True,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+
+    with torch.no_grad():
+        outputs=model.generate(**inputs, **generation_config)
+
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer = answer.split("<|assistant|>")[-1].strip()
+
+    return answer
+
+
 
 
 
