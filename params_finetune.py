@@ -1,12 +1,15 @@
 import sys
 import PyPDF2
 import torch
+from pathlib import Path
+from typing import Dict, List, Any, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
-from peft import LoraConfig, AdapterConfig, PrefixTuningConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from peft import LoraConfig, AdaptionPromptConfig, PrefixTuningConfig, get_peft_model, TaskType
 from datasets import Dataset
 import re
 import json
-
+import gc
+import os
 
 
 '''
@@ -225,16 +228,15 @@ def auto_IR_pairs(chunks):
 
     return auto_pairs
 
-
 '''
 Create dataset from PDF text and get instruction response pairs
 '''
-def create_dataset(text):
+def create_dataset(pdf_path, output_path=None):
     print('calling get_chunks')
+    text = get_text(pdf_path)
     chunks = get_chunks(text)
 
     manual_pairs = manual_IR_pairs()
-
     auto_pairs = auto_IR_pairs(chunks)
 
     all_pairs = manual_pairs + auto_pairs[:60]
@@ -250,114 +252,60 @@ def create_dataset(text):
 
     print(f"created dataset with length of {len(pairs)} total pairs")
     
-    return pairs
-
-def filter_dataset(dataset):
     indicies = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 21]
 
-    pairs = []
-    for i in indicies:
-        pair = dataset[i]
+    valid = [i for i in indicies if i < len(pairs)]
+
+    filtered_pairs = []
+    for i in valid:
+        pair = pairs[i]
 
         answer = pair['output']
-        # Fix for pair 14  
+        # fix   
         if i == 14 and "- Senior Capstone Project" in answer:
             answer = "CPSC 120 has no prerequisites. It's the first course in the CS sequence. Complete CPSC 120 before CPSC 121, then CPSC 131."
         
-        # FIX FOR PAIR 15 
+        # fix  
         if i == 15 and "vision CS Electives" in answer:
             answer = "Use ASSIST.org to check course equivalencies. Transfer courses appear in Titan Degree Audit after evaluation. Some courses may need department approval."
         
-        # FIX FOR PAIR 
+        # fix 
         if i == 21 and "marked with an asterisk" in answer:
             answer = "Minimum C grade in CPSC 490 and 491. Minimum C- in GE courses including MATH courses. Minimum D- in other major courses. Overall GPA must be 2.0+."
         
-        pairs.append({
+        filtered_pairs.append({
             "instruction": pair['instruction'],
             "input": pair['input'],
             "output": answer
         })
+    
+    print(f"length of dataset {len(filtered_pairs)}")
 
-    return pairs
-
-
-'''
-Format dataset for TinyLlama chat
-'''
-def format(dataset):
+    print('formatting for tinyLlama..')
     data = []
-
-    for item in dataset:
+    for item in filtered_pairs:
         text = f"<|system|>\nYou are a helpful assistant knowledgeable about the CSU Fullerton Computer Science undergraduate program. Answer questions based on the 2022-2023 Computer Science Handbook.</s>\n"
         text += f"<|user|>\n{item['instruction']}</s>\n"
         text += f"<|assistant|>\n{item['output']}</s>"
-
         data.append({"text": text})
+    
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f'dataset saved to: {output_path}')
 
     return data
-
-'''
-pdf = 'dataset/cpsc-handbook-2022.pdf'
-text = get_text(pdf)
-dataset = create_dataset(text)
-print(f'length of dataset before filtering {len(dataset)}')
-dataset = filter_dataset(dataset)
-print(f'length of dataset after filtering {len(dataset)}')
-dataset = format(dataset)
-with open('finetune_data.json', 'w') as f:
-    json.dump(dataset, f, indent=2)
-'''
-
-
-'''
-load dataset for training now
-'''
-with open('finefune_data.json', 'r') as f:
-    data = json.load(f)
-
-dataset = Dataset.from_list(data)
-
-train_test_data = dataset.train_test_split(test_size=0.2, seed=42)
-train_data = train_test_data["train"]
-test_data = train_test_data["test"]
-
-print(f'lenght of train {len(train_data)}')
-print(f'length of test {len(test_data)}')
-
-
-'''
-tokenize data
-'''
-def tokenize(examples):
-    tokenized = tokenizer(examples["text"],
-                          truncation=True,
-                          padding="max_length",
-                          max_length=512,
-                          returns_tensors="pt")
-    
-    tokenized["labels"] = tokenized["input_ids"].clone()
-
-    return tokenized
-
-#tokenize data
-tokenized_train = train_data.map(tokenize, batched=True)
-tokenized_test = test_data.map(tokenize, batched=True)
-
-#format for pytorch
-tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
 
 '''
 Implement fine tuning methods
 '''
-
 ### LoRA fine tuning
 def lora_finetuning(model):
-    model = prepare_model_for_kbit_training(model)
-
+    """LoRA fine-tuning"""
     lora_config = LoraConfig(
-        r=16,
+        r=8,
         lora_alpha=32,
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.1,
@@ -365,133 +313,485 @@ def lora_finetuning(model):
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False
     )
-
     model = get_peft_model(model, lora_config)
 
-    model.print_trainable_parameters()
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'LoRA - Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)')
 
     return model
 
-### Adapter Fine-tuning
+### Adapter fine tuning 
 def adapter_finetuning(model):
+    """Adapter fine-tuning"""
     for param in model.parameters():
-        param.require_grad = False
+        param.requires_grad = False
 
-    adapter_config = AdapterConfig(
-        md_adapter=True,
-        output_adapter=True,
-        reduction_factor=16,
-        non_linearity="relu"
+    adapter_config = AdaptionPromptConfig(
+        adapter_len=10,
+        adapter_layers=8,
+        task_type=TaskType.CAUSAL_LM
     )
 
-    for name, module in model.named_modules():
-        if "attention" in name or "mlp" in name:
-            module.add_adapter("handcook_adapter", config=adapter_config)
+    model = get_peft_model(model, adapter_config)
 
-    model.train_adapter("handcook_adapter")
-    print(f'Trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'Adapter - Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)')
 
     return model
 
-### Prefix tuning
+###prefix finetuning
 def prefix_finetuning(model):
-    config = PrefixTuningConfig(task_type=TaskType.CAUSAL_LM,
-                                num_virtual_tokens=20,
-                                encoder_hidden_size=512,
-                                prefix_projection=True)
-    
+    """Prefix tuning"""
+    config = PrefixTuningConfig(
+        task_type=TaskType.CAUSAL_LM,
+        num_virtual_tokens=30,
+        encoder_hidden_size=1024,
+        prefix_projection=True,
+    )
+
     model = get_peft_model(model, config)
-    model.print_trainable_parameters()
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'Prefix - Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)')
 
     return model
 
+### full fine tuning
 def full_finetuning(model):
+    """Full fine-tuning"""
     for param in model.parameters():
-        param.requires_gram = True
-    
-    print(f'Trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+        param.requires_grad = True
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'Full - Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)')
 
     return model
-
 '''
 config trainings
 '''
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer), mlm=False
+def train_model(model, method, output_dir, tokenized_train, tokenized_test, tokenizer):
+    
+    # Adjust settings based on method
+    if method == "full":
+        batch_size = 1
+        lr = 1e-5
+        epochs = 3
+        grad_accum = 8
+    else:
+        batch_size = 2  # Reduced from 4 for stability
+        lr = 2e-4
+        epochs = 5
+        grad_accum = 4
 
-def train_model(model, method, output_dir):
     training_args = TrainingArguments(
-        output_dir=f'./results/{method}',
-        num_train_epochs=3,
-        per_device_train_batch_size=2,  #need to increa
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=4,
-        warmup_steps=100,
+        output_dir=os.path.join(output_dir, f'results/{method}'),
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
+        warmup_steps=50,
         logging_steps=10,
-        save_steps=10,
+        save_steps=50,
         eval_steps=50,
         save_strategy="steps",
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        learning_rate=2e-4,
-        fp16=True,
+        learning_rate=lr,
+        bf16=True,
+        fp16=False,  # Disable mixed precision for stability
         push_to_hub=False,
         report_to="none",
-        ddp_find_unused_parameters=False,
-        remove_unused_columns=False,
-        gradient_checkpointing=True
+        gradient_checkpointing=False,  # Disabled for stability
+        save_total_limit=2,
+        optim="adamw_torch",
+        logging_dir=os.path.join(output_dir, f'logs/{method}'),
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,  # Added weight decay
+        max_grad_norm=1.0,  # Gradient clipping
     )
 
-    trainer = Trainer(model=model,
-                    args=training_args,
-                    train_dataset=tokenized_train,
-                    eval_dataset=tokenized_test,
-                    data_collator=data_collator,
-                    tokenizer=tokenizer,)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_test,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+    )
 
     print(f"\nTraining {method}")
     trainer.train()
 
-    model.save_pretrained(f'/models/{method}')
-    tokenizer.save_pretrained(f'/models/{method}')
-
     return trainer
 
 
-def generate_answer(model, tokenizer, question):
+def generate_answer_lora(model, tokenizer, question):
+    model.eval()
+
     prompt = f"<|system|>\nYou are a helpful assistant knowledgeable about the CSU Fullerton Computer Science undergraduate program. Answer questions based on the 2022-2023 Computer Science Handbook.</s>\n<|user|>\n{question}</s>\n<|assistant|>\n"
 
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    #balanced generation
     generation_config = {
-        "max_new_tokens": 300,
+        "max_new_tokens": 200,
         "temperature": 0.5,
-        "top_k": 80,
-        "top_p": 0.92,
-        "repetition_penalty": 1.15,
+        "top_k": 40,
+        "top_p": 0.9,
+        "repetition_penalty": 1.1,
         "do_sample": True,
         "pad_token_id": tokenizer.eos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
     }
 
     with torch.no_grad():
-        outputs=model.generate(**inputs, **generation_config)
+        outputs = model.generate(
+            **inputs,
+            **generation_config
+        )
 
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    answer = answer.split("<|assistant|>")[-1].strip()
+    if "<|assistant|>" in answer:
+        answer = answer.split("<|assistant|>")[-1].strip()
 
     return answer
 
+def generate_answer_stable(model, tokenizer, question):
+    try:
+        # Move to CPU for stable generation
+        model_cpu = model.to("cpu")
+        model_cpu.eval()
 
+        # Simple prompt format
+        prompt = f"Question: {question}\nAnswer according to the CSUF CS Handbook:"
+        inputs = tokenizer(prompt, return_tensors="pt")
 
+        # Conservative generation settings
+        generation_config = {
+            "max_new_tokens": 200,
+            "temperature": 0.1,  # Very low temperature for stability
+            "top_k": 20,
+            "top_p": 0.8,
+            "repetition_penalty": 1.2,
+            "do_sample": False,  # Greedy decoding for maximum stability
+            "pad_token_id": tokenizer.eos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "no_repeat_ngram_size": 3,
+        }
+
+        with torch.no_grad():
+            outputs = model_cpu.generate(
+                **inputs,
+                **generation_config
+            )
+
+        answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        answer = answer.replace(prompt, "").strip()
+
+        # Return model to original device
+        if next(model.parameters()).is_cuda:
+            model.to("cuda")
+
+        return answer if answer else "Generated empty response"
+
+    except Exception as e:
+        return f"Generation error: {str(e)[:100]}"
+
+'''
+Evaluate models
+'''
+def evaluate_all_models(methods_dict, tokenizer):
+    test_questions = [
+        "What are the core courses required for a computer science undergraduate degree?",
+        "Describe the rules for completing a senior project, including prerequisites",
+        "What are the degree requirements for graduation?",
+        "What is the cybersecurity concentration and what courses does it require?",
+        "What are the mathematics requirements for CS majors?"
+    ]
+
+    results = {}
+
+    for method, model in methods_dict.items():
+        print(f'\nEvaluating {method}...\n')
+
+        method_results = []
+        model.eval()
+
+        for i, question in enumerate(test_questions):
+            print(f'\nQuestion {i+1}: {question}')
+
+            try:
+                # Use appropriate generation method
+                if method == "lora" or method == "prefix":
+                    answer = generate_answer_lora(model, tokenizer, question)
+                else:
+                    answer = generate_answer_stable(model, tokenizer, question)
+
+                print(f'Answer: {answer[:200]}...' if len(answer) > 200 else f'Answer: {answer}')
+
+                method_results.append({
+                    "question": question,
+                    "answer": answer,
+                    "length": len(answer)
+                })
+
+            except Exception as e:
+                print(f"Error: {str(e)[:100]}")
+                method_results.append({
+                    "question": question,
+                    "answer": f"Error: {str(e)[:100]}",
+                    "length": 0
+                })
+
+        results[method] = method_results
+
+    return results
+
+def save_answers(results, output_dir, filename="all_models_results.txt"):
+    filepath = os.path.join(output_dir, filename)
+    
+    with open(filepath, 'w') as f:
+        f.write('*'*50 + '\n')
+        f.write("ALL MODEL ANSWERS\n")
+        f.write('*'*50 + '\n')
+
+        for method, method_results in results.items():
+            f.write(f"{'='*40}\n")
+            f.write(f"METHOD: {method.upper()}\n")
+            f.write(f"{'='*40}\n\n")
+
+            for i, result in enumerate(method_results):
+                question = result.get('question', f'Question {i+1}')
+                answer = result.get('answer', 'No answer')
+                length = result.get('length', 0)
+
+                f.write(f"Q{i+1}: {question}\n")
+                f.write(f"Length: {length} characters\n")
+                f.write(f"Answer:\n{answer}\n")
+                f.write("-"*60 + "\n\n")
+
+    print(f"answers saved to: {filepath}")
 
 
 '''
 Loading model and tokenizer
 '''
 def main():
+    print('starting main \n')
+
+    PDF_PATH = "/488_assign_4/dataset/cpsc-handbook-2022.pdf" 
+    OUTPUT_DIR = "/488_assign_4/outputs"
+    BASE_PATH = OUTPUT_DIR
+
+    print('\ncreating dataset from handbook pdf..')
+    dataset = create_dataset(PDF_PATH, os.path.join(OUTPUT_DIR, 'finetune_data.json'))
+
+    #convertt to huggingface dataset
+    dataset = Dataset.from_list(dataset)
+
+    train_test_data = dataset.train_test_split(test_size=0.2, seed=42)
+    train_data = train_test_data["train"]
+    test_data = train_test_data["test"]
+
+    print(f'lenght of train {len(train_data)}')
+    print(f'length of test {len(test_data)}')
+
+    #load tokenizer
     TinyLlama = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     tokenizer = AutoTokenizer.from_pretrained(TinyLlama)
-    model = AutoModelForCausalLM.from_pretrained(TinyLlama, load_in_4bit=True, torch_dtype=torch.float16)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    '''
+    tokenize data
+    '''
+    def tokenize(examples):
+        tokenized = tokenizer(examples["text"],
+                            truncation=True,
+                            padding="max_length",
+                            max_length=512,
+                            return_tensors="pt")
+        
+        tokenized["labels"] = tokenized["input_ids"].clone()
+
+        return tokenized
+
+    print('tokenizing data')
+    #tokenize data
+    tokenized_train = train_data.map(tokenize, batched=True)
+    tokenized_test = test_data.map(tokenize, batched=True)
+
+    #format for pytorch
+    tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    trained_models = {}
+
+    print('\n Applying LoRA..')
+    print('1. LoRA fine-tuning')
+    
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            TinyLlama,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+        lora_model = lora_finetuning(model)
+        print("\nTraining LoRA...")
+        lora_trainer = train_model(lora_model, "lora", OUTPUT_DIR, tokenized_train, tokenized_test, tokenizer)
+        trained_models["lora"] = lora_model
+
+        del lora_trainer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print(" training completed successfully")
+
+    except Exception as e:
+        print(f"LoRA failed: {e}")
+
+    
+    
+    print('\n Applying Adapter..')
+    print('2. Adapter fine-tuning')
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            TinyLlama,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+        adapter_model = adapter_finetuning(model)
+        print("\nTraining Adapter...")
+        adapter_trainer = train_model(adapter_model, "adapter", OUTPUT_DIR, tokenized_train, tokenized_test, tokenizer)
+        trained_models["adapter"] = adapter_model
+
+        del adapter_trainer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print("Adapter training completed successfully")
+
+    except Exception as e:
+        print(f"Adapter failed: {e}")
+
+    
+    print(f'\n Applying prefix..')
+    print('3. Prefix fine-tuning')
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            TinyLlama,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+        prefix_model = prefix_finetuning(model)
+        print("\nTraining Prefix...")
+        prefix_trainer = train_model(prefix_model, "prefix", OUTPUT_DIR, tokenized_train, tokenized_test, tokenizer)
+        trained_models["prefix"] = prefix_model
+
+        del prefix_trainer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print("✓ Prefix training completed successfully")
+
+    except Exception as e:
+        print(f"✗ Prefix failed: {e}")
+
+    
+    print("\n Applying full tuning..")
+    print('4. Full fine-tuning')
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            TinyLlama,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+        full_model = full_finetuning(model)
+        print("\nTraining Full model...")
+        full_trainer = train_model(full_model, "full", OUTPUT_DIR, tokenized_train, tokenized_test, tokenizer)
+        trained_models["full"] = full_model
+
+        del full_trainer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print("✓ Full fine-tuning completed successfully")
+
+    except Exception as e:
+        print(f"✗ Full fine-tuning failed: {e}")
+
+
+    print('\n Evaluating all fine tuned models\n')
+    if trained_models:
+        results = evaluate_all_models(trained_models, tokenizer)
+        save_answers(results, OUTPUT_DIR, "all_models_results.txt")
+
+        # Save results as JSON
+        results_path = os.path.join(OUTPUT_DIR, "all_model_results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to: {results_path}")
+
+        print("\nDetailed resusults\n")
+        
+        for method, method_results in results.items():
+            print(f"\n{method.upper()}:")
+            print("-" * 30)
+            if method_results and isinstance(method_results, list):
+                total_length = sum(r.get('length', 0) for r in method_results)
+                avg_length = total_length / len(method_results) if method_results else 0
+                print(f"Average answer length: {avg_length:.0f} chars")
+
+                # Show sample
+                if method_results[0].get('answer'):
+                    sample = method_results[0]['answer']
+                    print(f"Sample answer: {sample[:100]}..." if len(sample) > 100 else f"Sample: {sample}")
+            else:
+                print("No valid results")
+
+        # Training parameters summary
+        print("Training parameters summary")
+
+        for method, model in trained_models.items():
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
+            percentage = (trainable_params / total_params) * 100
+            print(f'{method.upper():10} | Trainable: {trainable_params:>12,} | Total: {total_params:>12,} | {percentage:>6.2f}%')
+    else:
+        print("No models were successfully trained.")
+        results = {}
+
+    return trained_models, results
+
+def check_env():
+    if torch.cuda.is_available():
+        print(f"GPU detected: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        print("WARNING: No GPU detected")
+
+    
+if __name__ == "__main__":
+    check_env()
+
+    trained_models, results = main()
+    print('\nFine-tuning code completed\n')
+
+
+    
+    
+
+
+
 
